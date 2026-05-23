@@ -1,3 +1,3 @@
 # pq-to-pg
 
-a fast, minimal tools that converts a directory of parquet files into individual postgres tables
+a fast, minimal tool that converts a directory of parquet files into individual postgres tables

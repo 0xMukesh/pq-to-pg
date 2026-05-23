@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/parquet-go/parquet-go"
 )
@@ -19,7 +20,8 @@ import (
 type Config struct {
 	ParquetDir string
 	DbConn     string
-	NumWorkers int
+	NumReaders int
+	NumWriters int
 	ChunkSize  int
 }
 
@@ -30,7 +32,8 @@ func main() {
 
 	flag.StringVar(&cfg.ParquetDir, "parquet-dir", "", "path to the directory which contains the parquet files")
 	flag.StringVar(&cfg.DbConn, "db-conn", "", "connection url to the postgres db")
-	flag.IntVar(&cfg.NumWorkers, "num-workers", -1, "number of concurrent workers to run")
+	flag.IntVar(&cfg.NumReaders, "num-readers", -1, "number of concurrent reader workers to run")
+	flag.IntVar(&cfg.NumWriters, "num-writers", -1, "number of concurrent writer workers to run")
 	flag.IntVar(&cfg.ChunkSize, "chunk-size", -1, "size of the chunk of parquet file content which the workers read at once")
 	flag.Parse()
 
@@ -39,8 +42,10 @@ func main() {
 		log.Fatal("missing --parquet-dir flag")
 	case cfg.DbConn == "":
 		log.Fatal("missing --db-conn flag")
-	case cfg.NumWorkers == -1:
-		log.Fatal("missing --num-workers flag")
+	case cfg.NumReaders == -1:
+		log.Fatal("missing --num-readers flag")
+	case cfg.NumWriters == -1:
+		log.Fatal("missing --num-writers flag")
 	case cfg.ChunkSize == -1:
 		log.Fatal("missing --chunk-size flag")
 	}
@@ -57,7 +62,13 @@ func main() {
 		log.Fatalf("%s is not a directory\n", cfg.ParquetDir)
 	}
 
-	pool, err := pgxpool.New(ctx, cfg.DbConn)
+	dbCfg, err := pgxpool.ParseConfig(cfg.DbConn)
+	if err != nil {
+		log.Fatalf("failed to parse db connection url: %s\n", err)
+	}
+	dbCfg.MaxConns = int32(cfg.NumWriters)
+
+	pool, err := pgxpool.NewWithConfig(ctx, dbCfg)
 	if err != nil {
 		log.Fatalf("failed to connect to postgres: %s\n", err)
 	}
@@ -71,7 +82,6 @@ func main() {
 		log.Fatalf("failed to read %s directory: %s\n", cfg.ParquetDir, err)
 	}
 
-	// capturing all the parquet files at the root level
 	parquetFiles := []string{}
 	allowedExts := []string{".pq", ".parquet"}
 	for _, entry := range entries {
@@ -82,53 +92,77 @@ func main() {
 		parquetFiles = append(parquetFiles, path.Join(cfg.ParquetDir, entry.Name()))
 	}
 
-	// creating tables for each of the file
-	// spinning one goroutine per file
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	createTableErrs := []error{}
+	pqFileTableNameMapping := make(map[string]string)
+	tableNameColsMapping := make(map[string][]string)
+	batch := &pgx.Batch{}
 
 	for _, pqFile := range parquetFiles {
-		wg.Go(func() {
-			if err = createTable(ctx, pqFile, pool); err != nil {
-				mu.Lock()
-				defer mu.Unlock()
-				createTableErrs = append(createTableErrs, err)
-			}
-		})
-	}
-	wg.Wait()
+		tableName, _, found := strings.Cut(filepath.Base(pqFile), ".")
+		if !found {
+			log.Fatalf("%s: failed to compute table name", pqFile)
+		}
 
-	for i, err := range createTableErrs {
-		log.Printf("%s: %s", parquetFiles[i], err.Error())
+		schema, err := inferSchema(pqFile)
+		if err != nil {
+			log.Fatalf("%s: failed to infer schema: %s", pqFile, err)
+		}
+
+		cols := []string{}
+		for _, v := range schema.Columns() {
+			cols = append(cols, v[0])
+		}
+
+		pqFileTableNameMapping[pqFile] = tableName
+		tableNameColsMapping[tableName] = cols
+
+		if err := buildCreateTableQuery(tableName, schema, batch); err != nil {
+			log.Fatalf("%s: failed to build create table query: %s", pqFile, err)
+		}
 	}
-	if len(createTableErrs) != 0 {
-		log.Fatal("error: failed to create table with the errors above")
+
+	br := pool.SendBatch(ctx, batch)
+	defer br.Close()
+	if _, err := br.Exec(); err != nil {
+		log.Fatalf("failed to create tables: %s", err)
+	}
+
+	errCh := make(chan error)
+
+	pqFilesCh := sliceToChan(parquetFiles)
+	fileChunksCh := setupReaders(pqFilesCh, errCh, pqFileTableNameMapping)
+	doneCh := setupWriters(ctx, fileChunksCh, errCh, pool, tableNameColsMapping)
+
+	go func() {
+		<-doneCh
+		close(errCh)
+	}()
+
+	for err := range errCh {
+		fmt.Println(err)
 	}
 }
 
-func createTable(ctx context.Context, path string, pool *pgxpool.Pool) error {
+func inferSchema(path string) (*parquet.Schema, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("failed to open file: %s", err)
+		return nil, fmt.Errorf("failed to open file: %s", err)
 	}
+	defer file.Close()
 
 	stat, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("failed to stat file: %s", err)
+		return nil, fmt.Errorf("failed to stat file: %s", err)
 	}
 
 	pf, err := parquet.OpenFile(file, stat.Size())
 	if err != nil {
-		return fmt.Errorf("failed to open file: %s", err)
+		return nil, fmt.Errorf("failed to open file: %s", err)
 	}
 
-	schema := pf.Schema()
-	tableName, _, found := strings.Cut(filepath.Base(path), ".")
-	if !found {
-		return fmt.Errorf("failed to compute table name")
-	}
+	return pf.Schema(), nil
+}
 
+func buildCreateTableQuery(tableName string, schema *parquet.Schema, batch *pgx.Batch) error {
 	sb := &strings.Builder{}
 	fmt.Fprintf(sb, "CREATE TABLE IF NOT EXISTS %s (", tableName)
 	for i, field := range schema.Fields() {
@@ -150,9 +184,72 @@ func createTable(ctx context.Context, path string, pool *pgxpool.Pool) error {
 	}
 	sb.WriteString(");")
 
-	if _, err = pool.Exec(ctx, sb.String()); err != nil {
-		return fmt.Errorf("failed to create the table %s: %s", tableName, err)
+	batch.Queue(sb.String())
+	return nil
+}
+
+func setupReaders(
+	pqFilesCh <-chan string, errCh chan<- error,
+	pqFileTableNameMapping map[string]string,
+) <-chan FileChunk {
+	fileChunksCh := make(chan FileChunk, cfg.NumReaders)
+	var wg sync.WaitGroup
+
+	for range cfg.NumReaders {
+		wg.Go(func() {
+			for item := range pqFilesCh {
+				tableName := pqFileTableNameMapping[item]
+				if err := readPqFile(item, tableName, cfg.ChunkSize, fileChunksCh); err != nil {
+					errCh <- fmt.Errorf("reader error: %s", err)
+				}
+			}
+		})
 	}
 
-	return nil
+	go func() {
+		wg.Wait()
+		close(fileChunksCh)
+	}()
+
+	return fileChunksCh
+}
+
+func setupWriters(
+	ctx context.Context,
+	fileChunksCh <-chan FileChunk, errCh chan<- error,
+	pool *pgxpool.Pool,
+	tableNameColsMapping map[string][]string,
+) <-chan any {
+	doneCh := make(chan any)
+	var wg sync.WaitGroup
+
+	for range cfg.NumWriters {
+		wg.Go(func() {
+			conn, err := pool.Acquire(ctx)
+			if err != nil {
+				errCh <- fmt.Errorf("writer error: failed to acquire connection from pool: %s", err)
+			}
+			defer conn.Release()
+
+			for chunk := range fileChunksCh {
+				cols := tableNameColsMapping[chunk.TableName]
+
+				if _, err := conn.Conn().CopyFrom(
+					ctx,
+					pgx.Identifier{chunk.TableName},
+					cols,
+					pgx.CopyFromRows(chunk.Data),
+				); err != nil {
+					errCh <- fmt.Errorf("writer error: failed to copy file chunk: %s", err)
+				}
+			}
+		})
+	}
+
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+
+	return doneCh
 }

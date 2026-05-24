@@ -1,8 +1,6 @@
-package main
+package core
 
-import (
-	"github.com/parquet-go/parquet-go"
-)
+import "github.com/parquet-go/parquet-go"
 
 // TODO: need to expand to much larger set
 var pqToPgMapping = map[string]string{

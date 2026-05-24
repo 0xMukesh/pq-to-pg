@@ -33,7 +33,7 @@ func CreateTables(ctx context.Context, pool *pgxpool.Pool, tableMetas map[string
 
 	for _, meta := range tableMetas {
 		sb := &strings.Builder{}
-		fmt.Fprintf(sb, "CREATE TABLE IF NOT EXISTS %s (", meta.Name)
+		fmt.Fprintf(sb, `CREATE TABLE IF NOT EXISTS %s (`, meta.Name)
 
 		for i, field := range meta.Fields {
 			pgType, ok := pqToPgMapping[field.Type().String()]

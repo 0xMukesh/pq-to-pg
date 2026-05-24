@@ -72,10 +72,8 @@ func BuildTableMetas(files []string) (map[string]TableMeta, error) {
 			cols = append(cols, col[0])
 		}
 
-		tableName, _, ok := strings.Cut(filepath.Base(f), ".")
-		if !ok {
-			return nil, fmt.Errorf("failed to compute table name %s: %s", f, err)
-		}
+		base := filepath.Base(f)
+		tableName := strings.TrimSuffix(base, filepath.Ext(base))
 
 		meta[f] = TableMeta{
 			Name:   tableName,

@@ -94,6 +94,8 @@ func main() {
 
 	pqFileTableNameMapping := make(map[string]string)
 	tableNameColsMapping := make(map[string][]string)
+	tableNameFieldsMapping := make(map[string][]parquet.Field)
+
 	batch := &pgx.Batch{}
 
 	for _, pqFile := range parquetFiles {
@@ -114,6 +116,7 @@ func main() {
 
 		pqFileTableNameMapping[pqFile] = tableName
 		tableNameColsMapping[tableName] = cols
+		tableNameFieldsMapping[tableName] = schema.Fields()
 
 		if err := buildCreateTableQuery(tableName, schema, batch); err != nil {
 			log.Fatalf("%s: failed to build create table query: %s", pqFile, err)
@@ -129,7 +132,7 @@ func main() {
 	errCh := make(chan error)
 
 	pqFilesCh := sliceToChan(parquetFiles)
-	fileChunksCh := setupReaders(pqFilesCh, errCh, pqFileTableNameMapping)
+	fileChunksCh := setupReaders(pqFilesCh, errCh, pqFileTableNameMapping, tableNameFieldsMapping)
 	doneCh := setupWriters(ctx, fileChunksCh, errCh, pool, tableNameColsMapping)
 
 	go func() {
@@ -190,7 +193,7 @@ func buildCreateTableQuery(tableName string, schema *parquet.Schema, batch *pgx.
 
 func setupReaders(
 	pqFilesCh <-chan string, errCh chan<- error,
-	pqFileTableNameMapping map[string]string,
+	pqFileTableNameMapping map[string]string, tableNameFieldsMapping map[string][]parquet.Field,
 ) <-chan FileChunk {
 	fileChunksCh := make(chan FileChunk, cfg.NumReaders)
 	var wg sync.WaitGroup
@@ -199,7 +202,9 @@ func setupReaders(
 		wg.Go(func() {
 			for item := range pqFilesCh {
 				tableName := pqFileTableNameMapping[item]
-				if err := readPqFile(item, tableName, cfg.ChunkSize, fileChunksCh); err != nil {
+				fields := tableNameFieldsMapping[tableName]
+
+				if err := readPqFile(item, tableName, fields, cfg.ChunkSize, fileChunksCh); err != nil {
 					errCh <- fmt.Errorf("reader error: %s", err)
 				}
 			}

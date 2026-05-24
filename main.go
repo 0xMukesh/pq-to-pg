@@ -195,7 +195,7 @@ func setupReaders(
 	pqFilesCh <-chan string, errCh chan<- error,
 	pqFileTableNameMapping map[string]string, tableNameFieldsMapping map[string][]parquet.Field,
 ) <-chan FileChunk {
-	fileChunksCh := make(chan FileChunk, cfg.NumReaders)
+	fileChunksCh := make(chan FileChunk, cfg.NumWriters)
 	var wg sync.WaitGroup
 
 	for range cfg.NumReaders {

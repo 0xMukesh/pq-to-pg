@@ -22,6 +22,8 @@ pq-to-pg \
 ## performance
 
 the following benchmark was executed on a dataset containing approximately 21 GB of parquet files on a machine with the following configuration:
+- machine: IdeaPad Slim 5 13ARP10
+- cpu: AMD Ryzen 7 7735HS (16) @ 4.83 GHz
 - memory: 16 GB RAM
 - disk: 512 GB SSD
 - go version: 1.26.3
